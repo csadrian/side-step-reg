@@ -83,7 +83,7 @@ model = MyModel()
 
 @tf.function
 def proj(u, v):
-  return (tf.matmul(tf.transpose(u), v) / tf.norm(u)) * u
+  return (tf.matmul(tf.transpose(u), v) / tf.matmul(tf.transpose(u), u)) * u
 
 @tf.function
 def train_step(images, labels, side_step=False):
