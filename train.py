@@ -86,22 +86,12 @@ def proj(u, v):
   return (tf.matmul(tf.transpose(u), v) / tf.matmul(tf.transpose(u), u)) * u
 
 @tf.function
-def train_step(images, labels, side_step=False):
+def train_step(images, labels):
   with tf.GradientTape() as tape:
     predictions = model(images, training=True)
     loss = loss_object(labels, predictions)
   gradients = tape.gradient(loss, model.trainable_variables)
-  
-  if side_step:
-    updated_gradients = []
-    for grad in gradients:
-      flat_grad = tf.reshape(grad, (-1, 1))
-      r = tf.random.normal(flat_grad.get_shape())
-      r_o = r - proj(flat_grad, r)
-      r_o = tf.reshape(r_o, grad.get_shape())
-      updated_gradients.append(r_o)
-    gradients = updated_gradients
-    
+      
   optimizer.apply_gradients(zip(gradients, model.trainable_variables))
 
   train_loss(loss)
@@ -149,7 +139,7 @@ for epoch in range(args.epochs):
   test_accuracy.reset_states()
 
   for images, labels in train_ds:
-    train_step(images, labels, True)
+    train_step(images, labels)
     for i in range(args.ssr_steps):
       ssr_step(images, labels)
 
