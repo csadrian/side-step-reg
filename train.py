@@ -7,6 +7,21 @@ import tensorflow as tf
 import numpy as np
 import sys
 
+
+import gin
+import gin.tf
+
+
+from absl import flags, app
+
+flags.DEFINE_multi_string(
+  'gin_file', None, 'List of paths to the config files.')
+flags.DEFINE_multi_string(
+  'gin_param', None, 'Newline separated list of Gin parameter bindings.')
+
+FLAGS = flags.FLAGS
+
+
 from tensorflow.python.keras.backend import set_session
 
 
@@ -19,13 +34,6 @@ def str2bool(v):
         return False
     else:
         raise argparse.ArgumentTypeError('Boolean value expected.')
-
-import argparse
-parser = argparse.ArgumentParser()
-parser.add_argument("--ssr_steps", dest='ssr_steps', type=int, default=0, help="Number of side-step regularization steps after each regular training step.")
-parser.add_argument("--epochs", dest='epochs', type=int, default=10, help="Number of training epochs.")
-
-args = parser.parse_args()
 
 
 batch_size = 50
@@ -56,7 +64,7 @@ test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(32)
 
 
 loss_object = tf.keras.losses.SparseCategoricalCrossentropy()
-optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
+optimizer = tf.keras.optimizers.SGD(learning_rate=0.001)
 
 train_loss = tf.keras.metrics.Mean(name='train_loss')
 train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
@@ -129,27 +137,36 @@ def test_step(images, labels):
   test_accuracy(labels, predictions)
 
 
+@gin.configurable
+def trainer(num_epochs=10, ssr_steps=1):
 
-for epoch in range(args.epochs):
+  for epoch in range(num_epochs):
 
-  # Reset the metrics at the start of the next epoch
-  train_loss.reset_states()
-  train_accuracy.reset_states()
-  test_loss.reset_states()
-  test_accuracy.reset_states()
+    # Reset the metrics at the start of the next epoch
+    train_loss.reset_states()
+    train_accuracy.reset_states()
+    test_loss.reset_states()
+    test_accuracy.reset_states()
 
-  for images, labels in train_ds:
-    train_step(images, labels)
-    for i in range(args.ssr_steps):
-      ssr_step(images, labels)
+    for images, labels in train_ds:
+      train_step(images, labels)
+      for i in range(ssr_steps):
+        ssr_step(images, labels)
 
-  for test_images, test_labels in test_ds:
-    test_step(test_images, test_labels)
+    for test_images, test_labels in test_ds:
+      test_step(test_images, test_labels)
 
-  template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
-  print(template.format(epoch+1,
+    template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+    print(template.format(epoch+1,
                         train_loss.result(),
                         train_accuracy.result()*100,
                         test_loss.result(),
                         test_accuracy.result()*100))
-  sys.stdout.flush()
+    sys.stdout.flush()
+
+def main(argv):
+  gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
+  trainer()
+
+if __name__ == '__main__':
+  app.run(main)

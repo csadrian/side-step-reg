@@ -1,0 +1,2 @@
+trainer.num_epochs=100
+trainer.ssr_steps=0
