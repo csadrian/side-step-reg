@@ -106,7 +106,8 @@ def train_step(images, labels):
   train_accuracy(labels, predictions)
 
 @tf.function
-def ssr_step(images, labels):
+@gin.configurable(blacklist=['images', 'labels'])
+def ssr_step(images, labels, ssr_alpha=0.01):
   with tf.GradientTape() as tape:
     predictions = model(images, training=True)
     loss = loss_object(labels, predictions)
@@ -119,7 +120,7 @@ def ssr_step(images, labels):
       r = tf.random.normal(flat_grad.get_shape())
       r_o = r - proj(flat_grad, r)
       r_o = tf.reshape(r_o, grad.get_shape())
-      updated_gradients.append(r_o)
+      updated_gradients.append(ssr_alpha*r_o)
     gradients = updated_gradients
     
   optimizer.apply_gradients(zip(gradients, model.trainable_variables))
