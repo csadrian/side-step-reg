@@ -99,7 +99,7 @@ def train_step(images, labels, side_step=False):
       r = tf.random.normal(flat_grad.get_shape())
       r_o = r - proj(flat_grad, r)
       r_o = tf.reshape(r_o, grad.get_shape())
-      updated_gradients.append(grad)
+      updated_gradients.append(r_o)
     gradients = updated_gradients
     
   optimizer.apply_gradients(zip(gradients, model.trainable_variables))
@@ -121,7 +121,7 @@ def ssr_step(images, labels):
       r = tf.random.normal(flat_grad.get_shape())
       r_o = r - proj(flat_grad, r)
       r_o = tf.reshape(r_o, grad.get_shape())
-      updated_gradients.append(grad)
+      updated_gradients.append(r_o)
     gradients = updated_gradients
     
   optimizer.apply_gradients(zip(gradients, model.trainable_variables))
