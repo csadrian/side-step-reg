@@ -28,35 +28,63 @@ flags.DEFINE_multi_string(
 FLAGS = flags.FLAGS
 
 
+HEIGHT = 32
+WIDTH = 32
+NUM_CHANNELS = 3
+NUM_TRAIN_SAMPLES = 50000
 
 
 from tensorflow.python.keras.backend import set_session
+
+@tf.function
+def preprocess(x, y):
+  x = tf.image.per_image_standardization(x)
+  return x, y
+
+
+@tf.function
+def augmentation(x, y):
+    x = tf.image.resize_with_crop_or_pad(
+        x, HEIGHT + 8, WIDTH + 8)
+    x = tf.image.random_crop(x, [HEIGHT, WIDTH, NUM_CHANNELS])
+    x = tf.image.random_flip_left_right(x)
+    return x, y	
+
+
+#@tf.function
+def schedule(epoch):
+  initial_learning_rate = BASE_LEARNING_RATE * BS_PER_GPU / 128
+  learning_rate = initial_learning_rate
+  for mult, start_epoch in LR_SCHEDULE:
+    if epoch >= start_epoch:
+      learning_rate = initial_learning_rate * mult
+    else:
+      break
+  tf.summary.scalar('learning rate', data=learning_rate, step=epoch)
+  return learning_rate
 
 
 batch_size = 6
 
 (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
 
-x_train = x_train.astype('float32') / 255
-x_test = x_test.astype('float32') / 255
+x_train = x_train.astype('float32')
+x_test = x_test.astype('float32')
 
-x_val = x_train[-10000:]
-y_val = y_train[-10000:]
-x_train = x_train[:-10000]
-y_train = y_train[:-10000]
+
+train_dataset = tf.data.Dataset.from_tensor_slices((x_train,y_train))
+test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+
+tf.random.set_seed(22)
+train_dataset = train_dataset.map(augmentation).map(preprocess).shuffle(NUM_TRAIN_SAMPLES).batch(batch_size, drop_remainder=True)
+test_dataset = test_dataset.map(preprocess).batch(batch_size, drop_remainder=True)
+
 
 train_size = x_train.shape[0]
 iters_per_epoch = train_size // batch_size
 
-val_size = x_val.shape[0]
-val_iters = val_size // batch_size
-
-
-
-train_ds = tf.data.Dataset.from_tensor_slices(
-    (x_train, y_train)).shuffle(10000).batch(batch_size)
-
-test_ds = tf.data.Dataset.from_tensor_slices((x_test, y_test)).batch(batch_size)
+#val_size = x_val.shape[0]
+#val_iters = val_size // batch_size
 
 
 
@@ -66,10 +94,12 @@ nored_loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=Fa
 
 optimizer = tf.keras.optimizers.Adam(learning_rate=0.001)
 
-train_loss = tf.keras.metrics.Mean(name='train_loss')
+train_sup_loss = tf.keras.metrics.Mean(name='train_sup_loss')
+train_reg_loss = tf.keras.metrics.Mean(name='train_reg_loss')
 train_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='train_accuracy')
 
-test_loss = tf.keras.metrics.Mean(name='test_loss')
+test_sup_loss = tf.keras.metrics.Mean(name='test_sup_loss')
+test_reg_loss = tf.keras.metrics.Mean(name='test_reg_loss')
 test_accuracy = tf.keras.metrics.SparseCategoricalAccuracy(name='test_accuracy')
 
 class MyModel(Model):
@@ -161,7 +191,8 @@ def train_step(images, labels, c_grads, dog_lambda=0.0):
 
   optimizer.apply_gradients(zip(g, model.trainable_variables))
 
-  train_loss(tf.reduce_mean(reg_loss))
+  train_reg_loss(tf.reduce_mean(reg_loss))
+  train_sup_loss(tf.reduce_mean(loss))
   train_accuracy(labels, predictions)
 
 @tf.function
@@ -185,7 +216,7 @@ def ssr_step(images, labels, ssr_alpha=0.01):
     
   optimizer.apply_gradients(zip(gradients_both, model.trainable_variables))
 
-  train_loss(loss)
+  train_sup_loss(loss)
   train_accuracy(labels, predictions)
 
 
@@ -194,7 +225,7 @@ def test_step(images, labels):
   predictions = model(images, training=False)
   t_loss = loss_object(labels, predictions)
 
-  test_loss(t_loss)
+  test_sup_loss(t_loss)
   test_accuracy(labels, predictions)
 
 
@@ -210,12 +241,14 @@ def trainer(num_epochs=10, ssr_steps=1):
   for epoch in range(num_epochs):
 
     # Reset the metrics at the start of the next epoch
-    train_loss.reset_states()
+    train_sup_loss.reset_states()
+    train_reg_loss.reset_states()
     train_accuracy.reset_states()
-    test_loss.reset_states()
+    test_sup_loss.reset_states()
+    test_reg_loss.reset_states()
     test_accuracy.reset_states()
 
-    for images, labels in train_ds:
+    for images, labels in train_dataset:
       train_step(images, labels, c_grads)
       for i in range(ssr_steps):
         ssr_step(images, labels)
@@ -224,24 +257,30 @@ def trainer(num_epochs=10, ssr_steps=1):
       #  for var in model.trainable_variables:
       #    c_grads[var.experimental_ref()].assign(tf.ones(tf.reshape(var, (-1, 1)).get_shape()))
 
-    for test_images, test_labels in test_ds:
+    for test_images, test_labels in test_dataset:
       test_step(test_images, test_labels)
 
     template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
-    print(template.format(epoch+1,train_loss.result(),
+    print(template.format(epoch+1,train_sup_loss.result(),
                         train_accuracy.result()*100,
-                        test_loss.result(),
+                        test_sup_loss.result(),
                         test_accuracy.result()*100))
+    neptune.send_metric('train_accuracy', x=step, y=train_accuracy.result())
+    neptune.send_metric('test_accuracy', x=step, y=test_accuracy.result())
+    neptune.send_metric('train_sup_loss', x=step, y=train_sup_loss.result())
+    neptune.send_metric('train_reg_loss', x=step, y=train_reg_loss.result())
+    neptune.send_metric('test_sup_loss', x=step, y=test_sup_loss.result())
+
     sys.stdout.flush()
 
 def main(argv):
   gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)
 
   use_neptune = "NEPTUNE_API_TOKEN" in os.environ
-  if False and use_neptune:
+  if use_neptune:
     neptune.init(project_qualified_name="csadrian/dog")
-    print(gin.config._CONFIG)
-    exp = neptune.create_experiment(params=gin.config._CONFIG, name="exp")
+    print(gin.operative_config_str())
+    exp = neptune.create_experiment(params={}, name="exp")
     #for tag in opts['tags'].split(','):
     #  neptune.append_tag(tag)
 
