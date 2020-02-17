@@ -4,6 +4,7 @@ from tensorflow.keras.models import Model
 import tensorflow.keras.models as models
 from tensorflow.keras.layers import Dense, GlobalAveragePooling2D
 from tensorflow.keras import layers
+from tensorflow.keras import regularizers
 
 from tensorflow.keras import backend as K
 import tensorflow as tf
@@ -28,11 +29,14 @@ flags.DEFINE_multi_string(
 FLAGS = flags.FLAGS
 
 
+batch_size = 6
+
 HEIGHT = 32
 WIDTH = 32
 NUM_CHANNELS = 3
 NUM_TRAIN_SAMPLES = 50000
-
+BS_PER_GPU = batch_size
+ 
 
 from tensorflow.python.keras.backend import set_session
 
@@ -64,7 +68,6 @@ def schedule(epoch):
   return learning_rate
 
 
-batch_size = 6
 
 (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
 
@@ -120,18 +123,59 @@ class MyModel(Model):
     x = self.dense_out(x)
     return x
 
-model = models.Sequential()
-model.add(layers.Conv2D(32, (3, 3), activation='relu', input_shape=(32, 32, 3)))
-model.add(layers.MaxPooling2D((2, 2)))
-model.add(layers.Conv2D(64, (3, 3), activation='relu'))
-model.add(layers.MaxPooling2D((2, 2)))
-model.add(layers.Conv2D(64, (3, 3), activation='relu'))
-model.add(layers.Flatten())
-model.add(layers.Dense(10))
+
+conv_tensors = []
+
+@gin.configurable()
+def build_model(weight_decay=1e-5):
+
+  model = models.Sequential()
+
+  model.add(layers.Conv2D(32, (3, 3), kernel_regularizer=regularizers.l2(weight_decay), input_shape=(32, 32, 3)))
+  #model.add(layers.BatchNormalization())
+  model.add(layers.LayerNormalization())
+  model.add(layers.Activation('relu'))
+
+  model.add(layers.Conv2D(32, (3, 3), kernel_regularizer=regularizers.l2(weight_decay)))
+  #model.add(layers.BatchNormalization())
+  model.add(layers.LayerNormalization())
+  model.add(layers.Activation('relu'))
+
+  model.add(layers.MaxPooling2D((2, 2)))
+
+  model.add(layers.Conv2D(64, (3, 3), kernel_regularizer=regularizers.l2(weight_decay)))
+  #model.add(layers.BatchNormalization())
+  model.add(layers.LayerNormalization())
+  model.add(layers.Activation('relu'))
+
+  model.add(layers.Conv2D(64, (3, 3), kernel_regularizer=regularizers.l2(weight_decay)))
+  #model.add(layers.BatchNormalization())
+  model.add(layers.LayerNormalization())
+  model.add(layers.Activation('relu'))
+
+  model.add(layers.MaxPooling2D((2, 2)))
+
+  model.add(layers.Conv2D(128, (3, 3), kernel_regularizer=regularizers.l2(weight_decay)))
+  #model.add(layers.BatchNormalization())
+  model.add(layers.LayerNormalization())
+  model.add(layers.Activation('relu'))
+
+  model.add(layers.Flatten())
+  model.add(layers.Dense(10))
+  model.build((batch_size, 32, 32, 3))
+
+  for layer in model.layers:
+    if isinstance(layer, layers.Conv2D):
+      conv_tensors.extend(layer.variables)
+      print(type(layer))
+
+  return model
+
+model = build_model()
+
 #model.add(layers.Activation('softmax'))
 #model = MyModel()
 
-model.build((batch_size, 32, 32, 3))
 
 
 @tf.function
@@ -145,50 +189,37 @@ def ce(y_true_tf, y_pred_tf):
 def proj(u, v):
   return (tf.matmul(tf.transpose(u), v) / tf.matmul(tf.transpose(u), u)) * u
 
+_done = False
+
 @tf.function
 @gin.configurable(blacklist=['images', 'labels'])
-def train_step(images, labels, c_grads, dog_lambda=0.0):
+def train_step(images, labels, dog_lambda=0.0):
   with tf.GradientTape() as tape2:
-   with tf.GradientTape() as tape:
-    predictions = model(images, training=True)
-    #nored_loss = ce(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
-    #loss = tf.reduce_sum(nored_loss)
-    loss = loss_object(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
-   gradients = tape.jacobian(loss, model.trainable_variables, experimental_use_pfor=False)
-   reg_loss = 0.0
-   for grad in gradients:
-     if len(grad.get_shape()) != 5:
-       continue
-     grad = tf.reshape(grad, (batch_size, -1))
-     M = tf.matmul(grad, tf.transpose(grad))
-     #reg_loss += tf.reduce_sum(tf.math.abs(grad), axis=[0,1])
-     reg_loss += tf.reduce_sum(tf.math.abs(M-tf.eye(M.get_shape()[0])))
-     #reg_loss += tf.reduce_mean(tf.math.abs(M * (tf.ones((M.get_shape()[0], M.get_shape()[0]))-tf.eye(M.get_shape()[0]))))
-   reg_loss = reg_loss / (batch_size)
-  gradients_reg = tape2.gradient(reg_loss, model.trainable_variables)
+    #tape2.watch(conv_tensors)
+    with tf.GradientTape() as tape:
+      predictions = model(images, training=True)
+      #nored_loss = ce(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
+      #loss = tf.reduce_sum(nored_loss)
+      loss = loss_object(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
+    gradients = tape.jacobian(loss, model.trainable_variables, experimental_use_pfor=False)
 
+    reg_loss = 0.0
+    for grad in gradients:
+      if len(grad.get_shape()) != 5:
+        continue
+      grad = tf.reshape(grad, (batch_size, -1))
+      M = tf.matmul(grad, tf.transpose(grad))
+      #reg_loss += tf.reduce_sum(tf.math.abs(grad), axis=[0,1])
+      reg_loss += tf.reduce_sum(tf.math.abs(M-tf.eye(M.get_shape()[0])))
+      #reg_loss += tf.reduce_mean(tf.math.abs(M * (tf.ones((M.get_shape()[0], M.get_shape()[0]))-tf.eye(M.get_shape()[0]))))
+
+  gradients_reg = tape2.gradient(reg_loss, model.trainable_variables)
   
   g = []
   for x, y in zip(gradients, gradients_reg):
       x = tf.reduce_mean(x, axis=0)
       g.append(x+dog_lambda*y)
   
-  if False:
-    i = 0
-    updated_gradients = []
-    for grad in gradients:
-      var_ref = model.trainable_variables[i].experimental_ref()
-      
-      flat_grad = tf.reshape(grad, (-1, 1))
-      g_o = flat_grad - proj(c_grads[var_ref], flat_grad)
-      c_grads[var_ref].assign_add(g_o)
-
-      g_o = tf.reshape(g_o, grad.get_shape())
-      updated_gradients.append(g_o)
-      i += 1
-
-    gradients = updated_gradients
-
   optimizer.apply_gradients(zip(g, model.trainable_variables))
 
   train_reg_loss(tf.reduce_mean(reg_loss))
@@ -228,14 +259,8 @@ def test_step(images, labels):
   test_sup_loss(t_loss)
   test_accuracy(labels, predictions)
 
-
 @gin.configurable
 def trainer(num_epochs=10, ssr_steps=1):
-
-  c_grads = {}
-
-  for var in model.trainable_variables:
-    c_grads[var.experimental_ref()] = tf.Variable(tf.ones(tf.reshape(var, (-1, 1)).get_shape()))
 
   step = 0
   for epoch in range(num_epochs):
@@ -249,13 +274,10 @@ def trainer(num_epochs=10, ssr_steps=1):
     test_accuracy.reset_states()
 
     for images, labels in train_dataset:
-      train_step(images, labels, c_grads)
+      train_step(images, labels)
       for i in range(ssr_steps):
         ssr_step(images, labels)
       step += 1
-      #if step % 100 == 0:
-      #  for var in model.trainable_variables:
-      #    c_grads[var.experimental_ref()].assign(tf.ones(tf.reshape(var, (-1, 1)).get_shape()))
 
     for test_images, test_labels in test_dataset:
       test_step(test_images, test_labels)
