@@ -8,6 +8,7 @@ from tensorflow.keras import regularizers
 
 from tensorflow.keras import backend as K
 import tensorflow as tf
+import tensorflow_datasets as tfds
 import numpy as np
 import sys
 import os
@@ -31,28 +32,23 @@ FLAGS = flags.FLAGS
 
 batch_size = 20
 
-HEIGHT = 32
-WIDTH = 32
-NUM_CHANNELS = 3
-NUM_TRAIN_SAMPLES = 50000
-BS_PER_GPU = batch_size
-
 
 from tensorflow.python.keras.backend import set_session
 
 @tf.function
 def preprocess(x, y):
+  x = tf.image.convert_image_dtype(x, tf.float32)
   x = tf.image.per_image_standardization(x)
   return x, y
 
 
 @tf.function
 def augmentation(x, y):
-    x = tf.image.resize_with_crop_or_pad(
-        x, HEIGHT + 8, WIDTH + 8)
-    x = tf.image.random_crop(x, [HEIGHT, WIDTH, NUM_CHANNELS])
+    image_shape = tf.shape(x)
+    x = tf.image.resize_with_crop_or_pad(x, image_shape[0] + 8, image_shape[1] + 8)
+    x = tf.image.random_crop(x, [image_shape[0], image_shape[1], image_shape[2]])
     x = tf.image.random_flip_left_right(x)
-    return x, y	
+    return x, y
 
 
 
@@ -81,26 +77,82 @@ def lr_schedule(epoch):
     return lr
 
 
-(x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
+@gin.configurable(blacklist=['batch_size'])
+def load_data(dataset_name='mnist', num_splits=1, batch_size=batch_size, seed=0):
+    """Load & preprocess training and test data."""
 
-x_train = x_train.astype('float32')
-x_test = x_test.astype('float32')
+    tf.random.set_seed(seed)
 
+    # Load training data from the tfds library
+    train_data, data_info = tfds.load(name=dataset_name,
+                                      split=tfds.Split.TRAIN,
+                                      as_supervised=True,
+                                      with_info=True)
 
-train_dataset = tf.data.Dataset.from_tensor_slices((x_train,y_train))
-test_dataset = tf.data.Dataset.from_tensor_slices((x_test, y_test))
+    # Load test data
+    test_data = tfds.load(name=dataset_name,
+                          split=tfds.Split.TEST,
+                          as_supervised=True)
 
-tf.random.set_seed(22)
-train_dataset = train_dataset.map(augmentation).map(preprocess).shuffle(NUM_TRAIN_SAMPLES).batch(batch_size, drop_remainder=True)
-test_dataset = test_dataset.map(preprocess).batch(batch_size, drop_remainder=True)
+    # Get data info
+    num_classes = data_info.features['label'].num_classes
+    num_train_examples = data_info.splits['train'].num_examples
+    num_test_examples = data_info.splits['test'].num_examples
+    image_shape = data_info.features['image'].shape
 
+    # Print data info
+    template = ("\nDataset: {}\n" +
+                "Image shape: {}\n" +
+                "Number of classes: {}\n" +
+                "Number of train images: {}\n" +
+                "Number of test images: {}\n")
 
-train_size = x_train.shape[0]
-iters_per_epoch = train_size // batch_size
+    print(template.format(dataset_name,
+                          image_shape,
+                          num_classes,
+                          num_train_examples,
+                          num_test_examples))
 
-#val_size = x_val.shape[0]
-#val_iters = val_size // batch_size
+    # Validate assumption that the number of test samples is divisible by batch size
+    assert (num_test_examples % batch_size == 0), (
+        'The batch size must be a divisor of {}'.format(num_test_examples))
 
+    # Validate assumption that data is in range [0, 255]
+    assert (data_info.features['image'].dtype == tf.uint8), (
+        'Image data type is not tf.uint8')
+
+    test_dataset = test_data.map(preprocess).batch(batch_size, drop_remainder=True)
+    train_dataset = train_data.map(augmentation).map(preprocess).shuffle(num_train_examples)
+
+    print('Number of splits: ', num_splits)
+
+    train_datasets = []
+
+    if num_splits > 1:
+        assert  num_classes % num_splits == 0,(
+            'The number classes should be divisible by the number of splits.')
+        num_concurrent_classes = num_classes // num_splits
+
+        labels = list(range(num_classes))
+
+        concurrent_labels = None
+        filter_fn = lambda x, y: tf.logical_and(tf.greater_equal(y, concurrent_labels[0]),
+                                                tf.less(y, concurrent_labels[-1]))
+
+        for i in range(0, num_classes, num_concurrent_classes):
+            concurrent_labels = labels[i:i+num_concurrent_classes]
+            print(concurrent_labels)
+            filtered_dataset = train_dataset.filter(filter_fn).batch(batch_size, drop_remainder=True)
+            train_datasets.append(filtered_dataset)
+
+    else:
+        train_dataset = train_dataset.batch(batch_size)
+        train_datasets.append(train_dataset)
+
+    assert len(train_datasets) == num_splits, (
+        'Number of training datasets must be equal to number of splits.')
+
+    return train_datasets, test_dataset
 
 
 step = tf.Variable(0, trainable=False)
@@ -411,7 +463,7 @@ def train_step(images, labels, dog_lambda=0.0):
 def ssr_step(images, labels, ssr_alpha=0.01):
   with tf.GradientTape() as tape:
     predictions = model(images, training=True)
-    loss = loss_object(labels, predictions)
+    loss = loss_object(tf.one_hot(labels, 10), predictions)
   gradients = tape.gradient(loss, model.trainable_variables)
   
   if True:
@@ -434,7 +486,7 @@ def ssr_step(images, labels, ssr_alpha=0.01):
 @tf.function
 def test_step(images, labels):
   predictions = model(images, training=False)
-  t_loss = loss_object(labels, predictions)
+  t_loss = loss_object(tf.one_hot(labels, 10), predictions)
 
   test_sup_loss(t_loss)
   test_accuracy(labels, predictions)
@@ -443,37 +495,42 @@ def test_step(images, labels):
 def trainer(num_epochs=10, ssr_steps=1):
 
   step = 0
-  for epoch in range(num_epochs):
+  train_datasets, test_dataset = load_data()
 
-    # Reset the metrics at the start of the next epoch
-    train_sup_loss.reset_states()
-    train_reg_loss.reset_states()
-    train_accuracy.reset_states()
-    test_sup_loss.reset_states()
-    test_reg_loss.reset_states()
-    test_accuracy.reset_states()
+  num_epochs_per_task = int(num_epochs/len(train_datasets))
 
-    for images, labels in train_dataset:
-      train_step(images, labels)
-      for i in range(ssr_steps):
-        ssr_step(images, labels)
-      step += 1
+  for train_dataset in train_datasets:
+    for epoch in range(num_epochs_per_task):
 
-    for test_images, test_labels in test_dataset:
-      test_step(test_images, test_labels)
+      # Reset the metrics at the start of the next epoch
+      train_sup_loss.reset_states()
+      train_reg_loss.reset_states()
+      train_accuracy.reset_states()
+      test_sup_loss.reset_states()
+      test_reg_loss.reset_states()
+      test_accuracy.reset_states()
 
-    template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
-    print(template.format(epoch+1,train_sup_loss.result(),
-                        train_accuracy.result()*100,
-                        test_sup_loss.result(),
-                        test_accuracy.result()*100))
-    neptune.send_metric('train_accuracy', x=step, y=train_accuracy.result())
-    neptune.send_metric('test_accuracy', x=step, y=test_accuracy.result())
-    neptune.send_metric('train_sup_loss', x=step, y=train_sup_loss.result())
-    neptune.send_metric('train_reg_loss', x=step, y=train_reg_loss.result())
-    neptune.send_metric('test_sup_loss', x=step, y=test_sup_loss.result())
+      for images, labels in train_dataset:
+        train_step(images, labels)
+        for i in range(ssr_steps):
+          ssr_step(images, labels)
+        step += 1
 
-    sys.stdout.flush()
+      for test_images, test_labels in test_dataset:
+        test_step(test_images, test_labels)
+
+      template = 'Epoch {}, Loss: {}, Accuracy: {}, Test Loss: {}, Test Accuracy: {}'
+      print(template.format(epoch+1,train_sup_loss.result(),
+                            train_accuracy.result()*100,
+                            test_sup_loss.result(),
+                            test_accuracy.result()*100))
+      neptune.send_metric('train_accuracy', x=step, y=train_accuracy.result())
+      neptune.send_metric('test_accuracy', x=step, y=test_accuracy.result())
+      neptune.send_metric('train_sup_loss', x=step, y=train_sup_loss.result())
+      neptune.send_metric('train_reg_loss', x=step, y=train_reg_loss.result())
+      neptune.send_metric('test_sup_loss', x=step, y=test_sup_loss.result())
+
+      sys.stdout.flush()
 
 def main(argv):
   gin.parse_config_files_and_bindings(FLAGS.gin_file, FLAGS.gin_param)

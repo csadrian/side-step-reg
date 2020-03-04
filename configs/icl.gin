@@ -1,0 +1,4 @@
+load_data.dataset_name='cifar10'
+load_data.num_splits=5
+trainer.num_epochs=20
+trainer.ssr_steps=0
