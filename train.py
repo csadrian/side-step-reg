@@ -8,6 +8,8 @@ from tensorflow.keras import regularizers
 
 from tensorflow.keras import backend as K
 import tensorflow as tf
+import tensorflow_addons as tfa
+
 import numpy as np
 import sys
 import os
@@ -42,7 +44,8 @@ from tensorflow.python.keras.backend import set_session
 
 @tf.function
 def preprocess(x, y):
-  x = tf.image.per_image_standardization(x)
+  x = x / 255.0
+  #x = tf.image.per_image_standardization(x)
   return x, y
 
 
@@ -55,30 +58,13 @@ def augmentation(x, y):
     return x, y	
 
 
-
-def lr_schedule(epoch):
-    """Learning Rate Schedule
-
-    Learning rate is scheduled to be reduced after 80, 120, 160, 180 epochs.
-    Called automatically every epoch as part of callbacks during training.
-
-    # Arguments
-        epoch (int): The number of epochs
-
-    # Returns
-        lr (float32): learning rate
-    """
-    lr = 1e-3
-    if epoch > 90:
-        lr *= 0.5e-3
-    elif epoch > 80:
-        lr *= 1e-3
-    elif epoch > 60:
-        lr *= 1e-2
-    elif epoch > 40:
-        lr *= 1e-1
-    print('Learning rate: ', lr)
-    return lr
+lr_schedule = tfa.optimizers.CyclicalLearningRate(
+    initial_learning_rate=1e-4,
+    maximal_learning_rate=1e-2,
+    step_size=2000,
+    scale_fn=lambda x: 1.,
+    scale_mode="cycle",
+    name="MyCyclicScheduler")
 
 
 (x_train, y_train), (x_test, y_test) = tf.keras.datasets.cifar10.load_data()
@@ -102,21 +88,20 @@ iters_per_epoch = train_size // batch_size
 #val_iters = val_size // batch_size
 
 
+#global_step = tf.Variable(0, trainable=False)
+"""
 
-step = tf.Variable(0, trainable=False)
 boundaries = [100000, 200000]
 values = [0.001, 0.0001, 0.00001]
 learning_rate_fn = tf.keras.optimizers.schedules.PiecewiseConstantDecay(
     boundaries, values)
 
 # Later, whenever we perform an optimization step, we pass in the step.
-learning_rate = learning_rate_fn(step)
+learning_rate = learning_rate_fn(global_step)
+"""
 
-
-loss_object = tf.keras.losses.CategoricalCrossentropy(reduction=tf.keras.losses.Reduction.NONE)
-nored_loss_object = tf.keras.losses.SparseCategoricalCrossentropy(from_logits=False, reduction=tf.keras.losses.Reduction.NONE)
-
-optimizer = tf.keras.optimizers.Adam(learning_rate=learning_rate)
+loss_object = tf.keras.losses.CategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
+optimizer = tf.keras.optimizers.Adam(learning_rate=lr_schedule)
 
 train_sup_loss = tf.keras.metrics.Mean(name='train_sup_loss')
 train_reg_loss = tf.keras.metrics.Mean(name='train_reg_loss')
@@ -132,7 +117,7 @@ def resnet_layer(inputs,
                  num_filters=16,
                  kernel_size=3,
                  strides=1,
-                 activation='relu',
+                 activation=tf.nn.swish,
                  batch_normalization=True,
                  conv_first=True):
     """2D Convolution-Batch Normalization-Activation stack builder
@@ -378,9 +363,8 @@ def train_step(images, labels, dog_lambda=0.0):
     #tape2.watch(conv_tensors)
     with tf.GradientTape() as tape:
       predictions = model(images, training=True)
-      #nored_loss = ce(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
-      #loss = tf.reduce_sum(nored_loss)
-      loss = loss_object(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
+      #loss = loss_object(tf.one_hot(labels, 10), tf.nn.softmax(predictions))
+      loss = loss_object(labels, predictions)
     gradients = tape.jacobian(loss, model.trainable_variables, experimental_use_pfor=False)
 
     reg_loss = 0.0
@@ -390,16 +374,16 @@ def train_step(images, labels, dog_lambda=0.0):
       grad = tf.reshape(grad, (batch_size, -1))
       M = tf.matmul(grad, tf.transpose(grad))
       #reg_loss += tf.reduce_sum(tf.math.abs(grad), axis=[0,1])
-      reg_loss += tf.reduce_sum(tf.math.abs(M-tf.eye(M.get_shape()[0])))
+      reg_loss += tf.reduce_sum(tf.math.square(M-tf.eye(M.get_shape()[0])))
       #reg_loss += tf.reduce_mean(tf.math.abs(M * (tf.ones((M.get_shape()[0], M.get_shape()[0]))-tf.eye(M.get_shape()[0]))))
 
   gradients_reg = tape2.gradient(reg_loss, model.trainable_variables)
-  
+
   g = []
   for x, y in zip(gradients, gradients_reg):
       x = tf.reduce_mean(x, axis=0)
       g.append(x+dog_lambda*y)
-  
+
   optimizer.apply_gradients(zip(g, model.trainable_variables))
 
   train_reg_loss(tf.reduce_mean(reg_loss))
@@ -454,10 +438,13 @@ def trainer(num_epochs=10, ssr_steps=1):
     test_accuracy.reset_states()
 
     for images, labels in train_dataset:
+
       train_step(images, labels)
       for i in range(ssr_steps):
         ssr_step(images, labels)
+
       step += 1
+      #global_step += 1
 
     for test_images, test_labels in test_dataset:
       test_step(test_images, test_labels)
